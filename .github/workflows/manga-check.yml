@@ -1,0 +1,33 @@
+name: Manga Check
+
+on:
+  schedule:
+    # cada 30 min (ajústalo si quieres)
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}  # permite ejecutarlo manualmente
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run unified scraper
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # OJO: tu archivo es .yml (no .yaml). Ajusto el nombre:
+          python unified_manga_scraper.py --library manga_library.yml
