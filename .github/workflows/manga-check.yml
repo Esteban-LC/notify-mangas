@@ -30,4 +30,4 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           # OJO: tu archivo es .yml (no .yaml). Ajusto el nombre:
-          python unified_manga_scraper.py --library manga_library.yml
+          python unified_manga_scraper.py --library manga_library.yaml
