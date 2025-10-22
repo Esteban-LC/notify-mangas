@@ -1,289 +1,368 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, sys, json, time
-from typing import Optional, Dict, Any, List
-from urllib.parse import urlparse, urljoin, parse_qs
+import os
+import re
+import json
+import time
+import math
+import html
+import random
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, Tuple, List
 
-import requests
-import cloudscraper
-from bs4 import BeautifulSoup
 import yaml
+import requests
+from bs4 import BeautifulSoup
 
-LIB_PATH = "manga_library.yml"
+# -----------------------------------
+# Configuración básica
+# -----------------------------------
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
-)
+LIB_FILE = "manga_library.yml"
+STATUS_FILE = "status.json"
 
-# ========= util: lectura de cookies por dominio desde secret =========
-# Formato del secret EXTRA_COOKIES_JSON:
-# {
-#   "animebbg.net": "xf_session=...; xf_user=...",
-#   "zonatmo.com": "cookie1=valor; cookie2=valor"
-# }
-def load_extra_cookies() -> Dict[str, Dict[str, str]]:
-    raw = os.getenv("EXTRA_COOKIES_JSON", "").strip()
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-        parsed: Dict[str, Dict[str, str]] = {}
-        for dom, cookie_str in data.items():
-            jar: Dict[str, str] = {}
-            for pair in cookie_str.split(";"):
-                if "=" in pair:
-                    k, v = pair.strip().split("=", 1)
-                    jar[k.strip()] = v.strip()
-            parsed[dom.lower()] = jar
-        return parsed
-    except Exception:
-        return {}
-
-# =================== Sesiones (requests y cloudscraper) ===================
-def build_requests_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Connection": "close",
-        "Upgrade-Insecure-Requests": "1",
-    })
-    proxy = os.getenv("PROXY_URL", "").strip()
-    if proxy:
-        s.proxies.update({"http": proxy, "https": proxy})
-    s.timeout = 25
-    return s
-
-def build_cf_session() -> requests.Session:
-    # cloudscraper ya aplica headers/JA3/anti-bot
-    s = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "desktop": True})
-    s.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"})
-    proxy = os.getenv("PROXY_URL", "").strip()
-    if proxy:
-        s.proxies.update({"http": proxy, "https": proxy})
-    return s
-
-def attach_domain_cookies(sess: requests.Session, netloc: str, cookies_map: Dict[str, Dict[str, str]]):
-    jar = cookies_map.get(netloc.lower()) or cookies_map.get(netloc.lower().lstrip("www."))
-    if not jar: 
-        return
-    for k, v in jar.items():
-        sess.cookies.set(k, v, domain="." + netloc)
-
-# =================== GET robusto ===================
-def smart_get(primary: requests.Session, url: str, cookies_map: Dict[str, Dict[str, str]]) -> requests.Response:
-    netloc = urlparse(url).netloc.lower()
-    # intentamos con requests (+cookies si hay)
-    attach_domain_cookies(primary, netloc, cookies_map)
-    r = primary.get(url)
-    if r.status_code != 403 and r.status_code < 500:
-        r.raise_for_status()
-        return r
-
-    # si hay 403 ó 5xx, reintentar con cloudscraper
-    cf = build_cf_session()
-    attach_domain_cookies(cf, netloc, cookies_map)
-    r2 = cf.get(url)
-    r2.raise_for_status()
-    return r2
-
-# =================== Discord ===================
-def send_discord(webhook_url: Optional[str], title: str, description: str, url: str, thumbnail: Optional[str] = None):
-    if not webhook_url:
-        return
-    embed = {
-        "title": title,
-        "description": description,
-        "url": url,
-        "color": 0x5865F2,
-        "footer": {"text": "Actualización de capítulos"},
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    if thumbnail:
-        embed["thumbnail"] = {"url": thumbnail}
-    try:
-        r = requests.post(webhook_url, json={"embeds": [embed]}, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"[WARN] Discord: {e}", file=sys.stderr)
-
-# =================== Parsers ===================
-CAP_RE = re.compile(r'Cap[ií]tulo\s+(\d+(?:\.\d+)?)', re.I)
-
-# --- animebbg (XenForo) ---
-def _animebbg_find_max_in_page(soup: BeautifulSoup) -> Optional[float]:
-    vals = []
-    for a in soup.select('.structItem-title a'):
-        txt = a.get_text(" ", strip=True)
-        m = CAP_RE.search(txt)
-        if m:
-            try: vals.append(float(m.group(1)))
-            except: pass
-    return max(vals) if vals else None
-
-def _animebbg_last_page(soup: BeautifulSoup) -> int:
-    last = soup.select_one('.pageNavSimple a.pageNavSimple-el--last')
-    if last and last.has_attr('href'):
-        try:
-            q = urlparse(last['href']).query
-            return int(parse_qs(q).get('page', [1])[0])
-        except Exception:
-            pass
-    pages = []
-    for li in soup.select('ul.pageNav-main li a'):
-        try: pages.append(int(li.get_text(strip=True)))
-        except: pass
-    return max(pages) if pages else 1
-
-def parse_animebbg(sess: requests.Session, cookies_map: Dict[str, Dict[str, str]], url: str) -> Optional[float]:
-    parsed = urlparse(url)
-    path = parsed.path.rstrip('/')
-    if not path.endswith('/capitulos'):
-        url = urljoin(url if url.endswith('/') else url + '/', 'capitulos')
-    r = smart_get(sess, url, cookies_map)
-    soup = BeautifulSoup(r.text, "lxml")
-
-    best = _animebbg_find_max_in_page(soup) or float('-inf')
-    last_page = _animebbg_last_page(soup)
-    if last_page and last_page > 1:
-        sep = '&' if ('?' in url) else '?'
-        last_url = f"{url}{sep}page={last_page}"
-        r2 = smart_get(sess, last_url, cookies_map)
-        soup2 = BeautifulSoup(r2.text, "lxml")
-        best_last = _animebbg_find_max_in_page(soup2)
-        if best_last is not None:
-            best = max(best, best_last)
-    return None if best == float('-inf') else best
-
-# --- Mangas No Sekai ---
-def parse_mangasnosekai(sess: requests.Session, cookies_map: Dict[str, Dict[str, str]], url: str) -> Optional[float]:
-    r = smart_get(sess, url, cookies_map)
-    soup = BeautifulSoup(r.text, "lxml")
-    vals = []
-    for a in soup.select('.contenedor-capitulo-miniatura .text-sm, .contenedor-capitulo-miniatura a'):
-        txt = a.get_text(" ", strip=True)
-        m = CAP_RE.search(txt)
-        if m:
-            try: vals.append(float(m.group(1)))
-            except: pass
-    return max(vals) if vals else None
-
-# --- m440.in ---
-def parse_m440(sess: requests.Session, cookies_map: Dict[str, Dict[str, str]], url: str) -> Optional[float]:
-    r = smart_get(sess, url, cookies_map)
-    soup = BeautifulSoup(r.text, "lxml")
-    vals = []
-    for a in soup.select('a, .wp-block-latest-posts__post-title'):
-        m = CAP_RE.search(a.get_text(" ", strip=True))
-        if m:
-            try: vals.append(float(m.group(1)))
-            except: pass
-    return max(vals) if vals else None
-
-# --- zonatmo ---
-def parse_zonatmo(sess: requests.Session, cookies_map: Dict[str, Dict[str, str]], url: str) -> Optional[float]:
-    r = smart_get(sess, url, cookies_map)
-    soup = BeautifulSoup(r.text, "lxml")
-    vals = []
-    for a in soup.select('.btn-collapse, .list-group-item h4, h4'):
-        m = CAP_RE.search(a.get_text(" ", strip=True))
-        if m:
-            try: vals.append(float(m.group(1)))
-            except: pass
-    return max(vals) if vals else None
-
-# --- mapa de parsers ---
-PARSERS = {
-    "animebbg.net": parse_animebbg, "www.animebbg.net": parse_animebbg,
-    "mangasnosekai.com": parse_mangasnosekai, "www.mangasnosekai.com": parse_mangasnosekai,
-    "m440.in": parse_m440, "www.m440.in": parse_m440,
-    "zonatmo.com": parse_zonatmo, "www.zonatmo.com": parse_zonatmo,
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
 }
 
-# =================== Lógica principal ===================
-def load_library(path: str) -> List[Dict[str, Any]]:
-    if not os.path.exists(path): return []
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or []
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+EXTRA_COOKIES_JSON = os.getenv("EXTRA_COOKIES_JSON", "").strip()
 
-def save_library(path: str, data: List[Dict[str, Any]]):
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+USE_PROXY = bool(PROXY_URL)
+PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if USE_PROXY else None
 
-def pick_parser(entry: Dict[str, Any]):
-    site = (entry.get("site") or "").strip().lower()
-    if site in PARSERS: return PARSERS[site]
-    netloc = urlparse(entry.get("url", "")).netloc.lower()
-    return PARSERS.get(netloc)
+# -----------------------------------
+# Utilidades: status.json (mensaje fijo “sin novedades”)
+# -----------------------------------
+
+def _load_status() -> Dict[str, Any]:
+    if os.path.exists(STATUS_FILE):
+        try:
+            with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_status(data: Dict[str, Any]) -> None:
+    with open(STATUS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def _discord_upsert_status(webhook_url: str, content: str) -> None:
+    """
+    Crea o edita (si existe) un mensaje 'status' del webhook para no spamear.
+    Guarda el message_id en status.json para poder editarlo después.
+    """
+    if not webhook_url:
+        return  # sin webhook
+
+    status = _load_status()
+    msg_id = status.get("status_message_id")
+
+    payload = {
+        "content": content,
+        "allowed_mentions": {"parse": []}
+    }
+
+    try:
+        if msg_id:
+            # Editar el mensaje existente
+            edit_url = f"{webhook_url}/messages/{msg_id}"
+            r = requests.patch(edit_url, json=payload, timeout=20)
+            if r.status_code == 404:
+                # No existe (lo borraron), creamos uno nuevo
+                r = requests.post(webhook_url, json=payload, timeout=20)
+                r.raise_for_status()
+                data = r.json()
+                status["status_message_id"] = data.get("id")
+                _save_status(status)
+            else:
+                r.raise_for_status()
+        else:
+            # Crear primer mensaje de estado
+            r = requests.post(webhook_url, json=payload, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            status["status_message_id"] = data.get("id")
+            _save_status(status)
+
+        # Guardar timestamp de última revisión
+        status["last_check_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        _save_status(status)
+
+    except requests.RequestException as e:
+        print(f"[WARN] No pude actualizar el mensaje de estado en Discord: {e}")
+
+# -----------------------------------
+# Carga/guardado de librería
+# -----------------------------------
+
+def load_library() -> Dict[str, Any]:
+    if not os.path.exists(LIB_FILE):
+        return {"series": []}
+    with open(LIB_FILE, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if "series" not in data or not isinstance(data["series"], list):
+        data["series"] = []
+    return data
+
+def save_library(lib: Dict[str, Any]) -> None:
+    with open(LIB_FILE, "w", encoding="utf-8") as f:
+        yaml.safe_dump(lib, f, allow_unicode=True, sort_keys=False)
+
+# -----------------------------------
+# HTTP helpers
+# -----------------------------------
+
+def build_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(DEFAULT_HEADERS)
+    # Cookies extra (si pasas JSON en secreto)
+    if EXTRA_COOKIES_JSON:
+        try:
+            extra_cookies = json.loads(EXTRA_COOKIES_JSON)
+            if isinstance(extra_cookies, dict):
+                for k, v in extra_cookies.items():
+                    s.cookies.set(k, v)
+        except Exception as e:
+            print(f"[WARN] No pude parsear EXTRA_COOKIES_JSON: {e}")
+    return s
+
+def fetch_html(url: str, session: requests.Session, retries: int = 2, sleep_s: float = 1.0) -> Optional[str]:
+    last_e = None
+    for _ in range(retries + 1):
+        try:
+            r = session.get(url, proxies=PROXIES, timeout=25)
+            if r.status_code == 403:
+                # a veces user-agent/cookies/proxy ayudan; aquí devolvemos igual para tratar parseo gracioso
+                print(f"[WARN] 403 Forbidden en {url}")
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last_e = e
+            time.sleep(sleep_s + random.random())
+    print(f"[ERROR] No se pudo obtener {url}: {last_e}")
+    return None
+
+# -----------------------------------
+# Parsers por sitio (devuelven último capítulo como float o int, y título opcional)
+# -----------------------------------
+
+_chapter_num_re = re.compile(r"cap[ií]tulo\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+
+def _extract_first_chapter_number(text: str) -> Optional[float]:
+    m = _chapter_num_re.search(text or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+def parse_mangasnosekai(html_text: str) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Busca el primer 'Capítulo X' en la lista de capítulos.
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    # Los items suelen tener "Capítulo NN" en tarjetas/grid
+    last = None
+    for tag in soup.find_all(text=_chapter_num_re):
+        num = _extract_first_chapter_number(tag)
+        if num is not None:
+            if last is None or num > last:
+                last = num
+    title_tag = soup.find("h1")
+    title = title_tag.get_text(strip=True) if title_tag else None
+    return last, title
+
+def parse_m440(html_text: str) -> Tuple[Optional[float], Optional[str]]:
+    """
+    m440.in — similar: buscar 'Capítulo NN' en la página del manga
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    last = None
+    for tag in soup.find_all(text=_chapter_num_re):
+        num = _extract_first_chapter_number(tag)
+        if num is not None:
+            if last is None or num > last:
+                last = num
+    title_tag = soup.find("h1")
+    title = title_tag.get_text(strip=True) if title_tag else None
+    return last, title
+
+def parse_zonatmo(html_text: str) -> Tuple[Optional[float], Optional[str]]:
+    """
+    ZonaTMO — en la ficha del manhwa/manhua suele listar capítulos tipo 'Capítulo 1.00', etc.
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    last = None
+    for tag in soup.find_all(text=_chapter_num_re):
+        num = _extract_first_chapter_number(tag)
+        if num is not None:
+            if last is None or num > last:
+                last = num
+    # Título
+    title = None
+    h1 = soup.find("h1")
+    if h1:
+        title = h1.get_text(" ", strip=True)
+    return last, title
+
+def parse_animebbg(html_text: str) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Tu XenForo (animebbg) — en /capitulos aparecen 'Capítulo X.XX'
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    last = None
+    # Buscar tarjetas que contengan 'Capítulo NN'
+    for tag in soup.find_all(text=_chapter_num_re):
+        num = _extract_first_chapter_number(tag)
+        if num is not None:
+            if last is None or num > last:
+                last = num
+    # Título: suele estar arriba en algún h1/h2
+    title = None
+    h_el = soup.find(["h1", "h2"])
+    if h_el:
+        title = h_el.get_text(" ", strip=True)
+    return last, title
+
+# -----------------------------------
+# Envío a Discord
+# -----------------------------------
+
+def send_discord_new(webhook_url: str, title: str, chapter_num: float, url: str, image_url: Optional[str] = None):
+    if not webhook_url:
+        return
+    ch_pretty = f"{chapter_num:.2f}".rstrip("0").rstrip(".")
+    embed = {
+        "title": f"{title}",
+        "description": f"**Nuevo capítulo detectado:** Capítulo {ch_pretty}",
+        "url": url,
+        "color": 0x00B894,  # verde
+        "footer": {"text": "Actualización de capítulos"},
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    if image_url:
+        embed["thumbnail"] = {"url": image_url}
+
+    payload = {
+        "content": None,
+        "embeds": [embed],
+        "allowed_mentions": {"parse": []}
+    }
+    try:
+        r = requests.post(webhook_url, json=payload, timeout=20)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[WARN] No pude notificar a Discord: {e}")
+
+# -----------------------------------
+# Router de sites
+# -----------------------------------
+
+def detect_site_parser(url: str):
+    url_l = url.lower()
+    if "mangasnosekai.com" in url_l:
+        return parse_mangasnosekai
+    if "m440.in" in url_l:
+        return parse_m440
+    if "zonatmo.com" in url_l:
+        return parse_zonatmo
+    if "animebbg.net" in url_l:
+        return parse_animebbg
+    return None
+
+# -----------------------------------
+# Main
+# -----------------------------------
 
 def main():
-    discord = os.getenv("DISCORD_WEBHOOK_URL", "").strip() or None
-    cookies_map = load_extra_cookies()
-    sess = build_requests_session()
+    session = build_session()
+    lib = load_library()
+    series_list: List[Dict[str, Any]] = lib.get("series", [])
 
-    lib = load_library(LIB_PATH)
-    if not lib:
-        print("No encuentro manga_library.yml (debe contener tu lista).")
-        sys.exit(0)
+    updates = []
+    checked = 0
 
-    changed = False
-    errors: List[str] = []
-    for entry in lib:
-        name = entry.get("name", "¿Sin nombre?")
-        url = entry.get("url")
-        if not url: continue
+    for item in series_list:
+        name = (item.get("name") or "").strip()
+        url = (item.get("url") or "").strip()
+        last_chapter_saved = item.get("last_chapter", 0)
 
-        parser = pick_parser(entry)
+        if not url:
+            continue
+
+        parser = detect_site_parser(url)
         if not parser:
-            errors.append(f"No tengo parser para {urlparse(url).netloc} en ‘{name}’")
+            print(f"[WARN] No tengo parser para: {url} — «{name}»")
+            continue
+
+        checked += 1
+        html_text = fetch_html(url, session)
+        if not html_text:
+            print(f"[ERROR] No pude leer HTML: {url}")
             continue
 
         try:
-            latest = parser(sess, cookies_map, url)
-        except requests.HTTPError as e:
-            errors.append(f"{name}: HTTP Error: {e} — {url}")
-            continue
+            last_chapter_found, title_found = parser(html_text)
         except Exception as e:
-            errors.append(f"{name}: {type(e).__name__}: {e} — {url}")
+            print(f"[ERROR] Falló el parser para {url}: {e}")
             continue
 
-        if latest is None:
+        if last_chapter_found is None:
+            print(f"[WARN] No detecté número de capítulo en: {url}")
             continue
 
-        prev = entry.get("last_chapter")
-        if prev is None:
-            entry["last_chapter"] = latest
-            changed = True
-            print(f"[BOOTSTRAP] {name} -> {latest}")
-            continue
+        title_use = title_found or name or "Nuevo capítulo"
+        # Si hay un capítulo nuevo
+        if float(last_chapter_found) > float(last_chapter_saved or 0):
+            # Notificar
+            send_discord_new(
+                DISCORD_WEBHOOK_URL,
+                title_use,
+                float(last_chapter_found),
+                url,
+                image_url=None
+            )
+            # Guardar update
+            updates.append(
+                (title_use, float(last_chapter_found), url)
+            )
+            # Actualizar en memoria
+            item["last_chapter"] = float(last_chapter_found)
 
-        try:
-            prev_num = float(prev)
-        except Exception:
-            prev_num = None
+        # Evitar dar demasiada caña a los sitios
+        time.sleep(random.uniform(0.6, 1.2))
 
-        if prev_num is None or latest > prev_num:
-            entry["last_chapter"] = latest
-            changed = True
-            title = f"{name} — Capítulo {latest:g}"
-            desc = f"Nuevo capítulo detectado: **{latest:g}**"
-            send_discord(discord, title, desc, url)
-            print(f"[NUEVO] {title}")
-        else:
-            print(f"[OK] {name}: sin cambios (último {prev_num:g})")
+    # Guardar librería si hubo cambios
+    save_library(lib)
 
-    if changed:
-        save_library(LIB_PATH, lib)
+    # --- Mensaje de ESTADO en Discord (se edita siempre el mismo) ---
+    series_count = len(series_list)
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    if updates:
+        status_text = f"✅ Novedades detectadas — última revisión: {now_utc} · ({series_count} series)"
+        _discord_upsert_status(DISCORD_WEBHOOK_URL, status_text)
+    else:
+        status_text = f"🕒 Sin novedades — última revisión: {now_utc} · ({series_count} series)"
+        _discord_upsert_status(DISCORD_WEBHOOK_URL, status_text)
+
+    # Log de bootstrap para Actions
+    if updates:
+        for t, ch, u in updates:
+            print(f"[UPDATE] {t} -> {ch} | {u}")
     else:
         print("Sin novedades.")
 
-    if errors and discord:
-        send_discord(discord, "Errores de scraping", "\n".join(errors[:10]), "https://github.com/")
-    for e in errors:
-        print("Error:", e)
 
 if __name__ == "__main__":
     main()
