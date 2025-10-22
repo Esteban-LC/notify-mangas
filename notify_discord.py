@@ -1,29 +1,42 @@
-\
 #!/usr/bin/env python3
-import os, json, sys, requests
+# -*- coding: utf-8 -*-
 
-WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-if not WEBHOOK:
-    print("[notify] Falta DISCORD_WEBHOOK_URL", file=sys.stderr)
-    sys.exit(0)  # no-op
+import os
+import json
+import argparse
+import requests
 
-path = sys.argv[1] if len(sys.argv) > 1 else "updates.json"
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-except Exception as e:
-    print(f"[notify] Sin archivo de updates ({e})", file=sys.stderr)
-    sys.exit(0)
+def send_embed(webhook: str, title: str, description: str, url: str):
+    payload = {
+        "embeds": [
+            {
+                "title": title,
+                "description": description,
+                "url": url,
+                "color": 0x2ecc71,
+            }
+        ]
+    }
+    r = requests.post(webhook, json=payload, timeout=30)
+    r.raise_for_status()
+    return r.text
 
-updates = data.get("updates", [])
-if not updates:
-    print("[notify] No hay novedades", file=sys.stderr)
-    sys.exit(0)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--webhook", required=False, default=os.getenv("DISCORD_WEBHOOK_URL", ""))
+    ap.add_argument("--payload", required=True, help="JSON con title/description/url")
+    args = ap.parse_args()
 
-lines = ["**Actualizaciones de capítulos:**"]
-for u in updates:
-    lines.append(f"• **{u['name']}** ({u['site']}) → {u['previous']} ➜ **{u['latest']}**\n<{u['url']}>")
+    if not args.webhook:
+        print("[INFO] No webhook de Discord: no se enviará nada.")
+        return
 
-payload = {"content": "\n".join(lines)}
-r = requests.post(WEBHOOK, json=payload, timeout=20)
-print(f"[notify] Discord status {r.status_code}")
+    data = json.loads(args.payload)
+    title = data.get("title", "Notificación")
+    description = data.get("description", "")
+    url = data.get("url", "")
+
+    send_embed(args.webhook, title, description, url)
+
+if __name__ == "__main__":
+    main()
