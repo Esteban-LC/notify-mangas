@@ -1,23 +1,16 @@
-# === ANIMEBBG (XenForo) ===
-- name: "Soy un cachorro valiente que vino a salvar a su hermana villana"
-  site: "animebbg.net"
-  url: "https://animebbg.net/comics/soy-un-cachorro-valiente-que-vino-a-salvar-a-su-hermana-villana.4602/capitulos"
-  last_chapter: null
-
-# === Mangas No Sekai (WordPress) ===
-- name: "Melodía de corazón de medianoche"
-  site: "mangasnosekai.com"
-  url: "https://mangasnosekai.com/manga/melodia-de-corazon-de-medianoche/"
-  last_chapter: null
-
-# === m440.in (WordPress) ===
-- name: "MILP Hunter from Another World"
-  site: "m440.in"
-  url: "https://m440.in/manga/milp-hunter-from-another-world/"
-  last_chapter: null
-
-# === ZONATMO (Laravel/Custom) ===
-- name: "¿La nueva jefa es mi exnovia?"
-  site: "zonatmo.com"
-  url: "https://zonatmo.com/library/manhua/84698/lanuevajefaesmiexnovia"
-  last_chapter: null
+- name: Soy un cachorro valiente que vino a salvar a su hermana villana
+  site: animebbg.net
+  url: https://animebbg.net/comics/soy-un-cachorro-valiente-que-vino-a-salvar-a-su-hermana-villana.4602/capitulos
+  last_chapter: 28.0
+- name: Melodía de corazón de medianoche
+  site: mangasnosekai.com
+  url: https://mangasnosekai.com/manga/melodia-de-corazon-de-medianoche/
+  last_chapter: 93.0
+- name: MILP Hunter from Another World
+  site: m440.in
+  url: https://m440.in/manga/milp-hunter-from-another-world/
+  last_chapter: 100.0
+- name: ¿La nueva jefa es mi exnovia?
+  site: zonatmo.com
+  url: https://zonatmo.com/library/manhua/84698/lanuevajefaesmiexnovia
+  last_chapter: 29.0
