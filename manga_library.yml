@@ -1,15 +1,20 @@
-- name: "Amistad rota, solo quería que estemos juntos "
-  site: "https://animebbg.net/"
-  url: "https://animebbg.net/comics/amistad-rota-solo-quer%C3%ADa-que-estemos-juntos.4640/"
+series:
+  - name: "Mato Seihei no Slave"
+    site: "manga-oni.com"
+    url: "https://manga-oni.com/lector/mato-seihei-no-slave/"
 
-- name: "Mato Seihei no Slave"
-  site: "manga-oni.com"
-  url: "https://manga-oni.com/lector/mato-seihei-no-slave/"
+  - name: "Melodía de corazón de medianoche"
+    site: "mangasnosekai.com"
+    url: "https://mangasnosekai.com/manga/melodia-de-corazon-de-medianoche/"
 
-- name: "Melodía de corazón de medianoche"
-  site: "mangasnosekai.com"
-  url: "https://mangasnosekai.com/manga/melodia-de-corazon-de-medianoche/"
+  - name: "MILP Hunter from Another World"
+    site: "m440.in"
+    url: "https://m440.in/manga/milp-hunter-from-another-world/"
 
-- name: "MILP Hunter from Another World"
-  site: "m440.in"
-  url: "https://m440.in/manga/milp-hunter-from-another-world/"
+  - name: "¿La nueva jefa es mi exnovia?"
+    site: "zonatmo.com"
+    url: "https://zonatmo.com/library/manhua/84698/lanuevajefaesmiexnovia"
+    
+  - name: "Amistad rota, solo quería que estemos juntos "
+    site: "https://animebbg.net/"
+    url: "https://animebbg.net/comics/amistad-rota-solo-quer%C3%ADa-que-estemos-juntos.4640/"
