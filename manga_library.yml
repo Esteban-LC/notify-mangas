@@ -1,19 +1,23 @@
-- name: "Mato Seihei no Slave"
-  url: "https://manga-oni.com/lector/mato-seihei-no-slave/"
-  last_chapter:
+# === ANIMEBBG (XenForo) ===
+- name: "Soy un cachorro valiente que vino a salvar a su hermana villana"
+  site: "animebbg.net"
+  url: "https://animebbg.net/comics/soy-un-cachorro-valiente-que-vino-a-salvar-a-su-hermana-villana.4602/capitulos"
+  last_chapter: null
 
+# === Mangas No Sekai (WordPress) ===
 - name: "Melodía de corazón de medianoche"
+  site: "mangasnosekai.com"
   url: "https://mangasnosekai.com/manga/melodia-de-corazon-de-medianoche/"
-  last_chapter:
+  last_chapter: null
 
+# === m440.in (WordPress) ===
 - name: "MILP Hunter from Another World"
+  site: "m440.in"
   url: "https://m440.in/manga/milp-hunter-from-another-world/"
-  last_chapter:
+  last_chapter: null
 
+# === ZONATMO (Laravel/Custom) ===
 - name: "¿La nueva jefa es mi exnovia?"
+  site: "zonatmo.com"
   url: "https://zonatmo.com/library/manhua/84698/lanuevajefaesmiexnovia"
-  last_chapter:
-
-- name: "Amistad rota, solo quería que estemos juntos "
-  url: "https://animebbg.net/comics/amistad-rota-solo-quer%C3%ADa-que-estemos-juntos.4640/"
-  last_chapter:
+  last_chapter: null
