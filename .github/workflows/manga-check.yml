@@ -3,9 +3,9 @@ name: Manga Check
 on:
   workflow_dispatch:            # ejecución manual
   schedule:
-    - cron: "*/10 * * * *"      # cada 10 minutos (en UTC)
+    - cron: "*/10 * * * *"      # cada 10 minutos (UTC)
 
-# evita que dos corridas se solapen si una tarda más de 10 min
+# evita que dos corridas se solapen
 concurrency:
   group: manga-check
   cancel-in-progress: true
@@ -16,11 +16,14 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15         # opcional, corta si algo se queda colgado
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 15
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -31,15 +34,19 @@ jobs:
 
       - name: Run unified scraper
         env:
+          # ⇩⇩ Pasa ambas por si usas uno u otro secreto
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
           EXTRA_COOKIES_JSON: ${{ secrets.EXTRA_COOKIES_JSON }}
+          # Pon "true" si quieres mensaje aun cuando no hay novedades
+          ALWAYS_NOTIFY: "false"
         run: |
           python unified_manga_scraper.py || true
 
       - name: Commit state if changed
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if [[ -n "$(git status --porcelain)" ]]; then
             git add manga_library.yml
@@ -48,3 +55,4 @@ jobs:
           else
             echo "Everything up-to-date"
           fi
+
