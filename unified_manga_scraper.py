@@ -1,320 +1,261 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import re
-import sys
-import json
-import time
-import math
-import argparse
-from typing import Dict, Any, List, Optional, Tuple
-from urllib.parse import urlparse
+import os, re, sys, json, time
+from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse, urljoin, parse_qs
 
 import requests
-import yaml
 from bs4 import BeautifulSoup
+import yaml
 
 LIB_PATH = "manga_library.yml"
 
-# --------- Sesión HTTP "humana" + Proxy opcional ----------
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/128.0.6613.84 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://google.com/",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Cache-Control": "max-age=0",
-})
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
-if PROXY_URL:
-    SESSION.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
 
-REQUEST_TIMEOUT = 25
-MAX_RETRIES = 2
-RETRY_SLEEP = 2.5
+# ------------ Session helper (headers, proxy opcional) ------------
+def build_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "close",
+    })
+    proxy = os.getenv("PROXY_URL", "").strip()
+    if proxy:
+        s.proxies.update({"http": proxy, "https": proxy})
+    s.timeout = 25
+    return s
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-
-
-# ------------------ Utilidades ----------------------------
-
-def get(url: str) -> requests.Response:
-    """
-    GET con reintentos básicos.
-    """
-    last_exc = None
-    for attempt in range(1, MAX_RETRIES + 2):
-        try:
-            resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            return resp
-        except Exception as e:
-            last_exc = e
-            if attempt <= MAX_RETRIES:
-                time.sleep(RETRY_SLEEP * attempt)
-            else:
-                raise
-    raise last_exc  # pragma: no cover
-
-
-def to_float_chapter(text: str) -> Optional[float]:
-    """
-    Extrae el primer número tipo capítulo (puede tener decimal).
-    """
-    # Soporta "Capítulo 135.50" o "Capítulo 136", etc.
-    m = re.search(r'cap[ií]tulo\s+(\d+(?:\.\d+)?)', text, re.I)
-    if not m:
-        # fallback: buscar cualquier número (caso extremo)
-        m = re.search(r'(\d+(?:\.\d+)?)', text)
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            return None
-    return None
-
-
-def domain(url: str) -> str:
-    return urlparse(url).netloc.lower()
-
-
-def send_discord(content: str):
-    if not DISCORD_WEBHOOK:
-        print(f"[INFO] Discord no configurado, mensaje:\n{content}\n")
+# ------------ Discord ------------
+def send_discord(webhook_url: Optional[str], title: str, description: str, url: str, thumbnail: Optional[str] = None):
+    if not webhook_url:
         return
+    embed = {
+        "title": title,
+        "description": description,
+        "url": url,
+        "color": 0x5865F2,
+        "footer": {"text": "Actualización de capítulos"},
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if thumbnail:
+        embed["thumbnail"] = {"url": thumbnail}
+    payload = {"embeds": [embed]}
     try:
-        r = SESSION.post(DISCORD_WEBHOOK, json={"content": content}, timeout=20)
+        r = requests.post(webhook_url, json=payload, timeout=20)
         r.raise_for_status()
     except Exception as e:
-        print(f"[WARN] Falló envío a Discord: {e}")
+        print(f"[WARN] No se pudo notificar a Discord: {e}", file=sys.stderr)
 
+# ================================================================
+# ==================== PARSERS POR SITIO =========================
+# ================================================================
 
-# ----------------- Parsers por dominio --------------------
+# -------- ANIMEBBG (XenForo) --------
+CAP_RE = re.compile(r'Cap[ií]tulo\s+(\d+(?:\.\d+)?)', re.I)
 
-def parse_manga_oni(html: str) -> Optional[float]:
-    """
-    manga-oni.com serie: revisar #c_list h3 con 'Capítulo'
-    """
-    soup = BeautifulSoup(html, "lxml")
-    caps = []
-    for h3 in soup.select("#c_list h3"):
-        t = h3.get_text(" ", strip=True)
-        ch = to_float_chapter(t)
-        if ch is not None:
-            caps.append(ch)
-    if caps:
-        return max(caps)
-    return None
-
-
-def parse_mangasnosekai(html: str) -> Optional[float]:
-    """
-    mangasnosekai.com: lista de 'Capítulo N' en el grid de capítulos.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    caps = []
-    # varios selectores posibles:
-    for node in soup.select(".container-capitulos .contenedor-capitulo-miniatura, .grid-capitulos .contenedor-capitulo-miniatura"):
-        text = node.get_text(" ", strip=True)
-        ch = to_float_chapter(text)
-        if ch is not None:
-            caps.append(ch)
-    if not caps:
-        # fallback: buscar en toda la página
-        text = soup.get_text(" ", strip=True)
-        for m in re.finditer(r'Cap[ií]tulo\s+(\d+(?:\.\d+)?)', text, re.I):
+def _animebbg_find_max_in_page(soup: BeautifulSoup) -> Optional[float]:
+    vals = []
+    for a in soup.select('.structItem-title a'):
+        txt = a.get_text(" ", strip=True)
+        m = CAP_RE.search(txt)
+        if m:
             try:
-                caps.append(float(m.group(1)))
+                vals.append(float(m.group(1)))
             except ValueError:
                 pass
-    if caps:
-        return max(caps)
-    return None
+    return max(vals) if vals else None
 
-
-def parse_zonatmo(html: str) -> Optional[float]:
-    """
-    zonatmo.com: 'Capítulo X.YY ...' aparece en los headers h4/a de la lista.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    caps = []
-    # Header de cada capítulo (colapsable)
-    for a in soup.select(".chapters li.upload-link h4 a.btn-collapse"):
-        ch = to_float_chapter(a.get_text(" ", strip=True))
-        if ch is not None:
-            caps.append(ch)
-    if not caps:
-        # fallback: buscar en toda la página
-        text = soup.get_text(" ", strip=True)
-        for m in re.finditer(r'Cap[ií]tulo\s+(\d+(?:\.\d+)?)', text, re.I):
-            try:
-                caps.append(float(m.group(1)))
-            except ValueError:
-                pass
-    if caps:
-        return max(caps)
-    return None
-
-
-def parse_m440(html: str) -> Optional[float]:
-    """
-    m440.in: buscar 'Capítulo N' globalmente (estructura varía).
-    """
-    soup = BeautifulSoup(html, "lxml")
-    text = soup.get_text(" ", strip=True)
-    caps = []
-    for m in re.finditer(r'Cap[ií]tulo\s+(\d+(?:\.\d+)?)', text, re.I):
+def _animebbg_last_page(soup: BeautifulSoup) -> int:
+    # botón "Último"
+    last = soup.select_one('.pageNavSimple a.pageNavSimple-el--last')
+    if last and last.has_attr('href'):
         try:
-            caps.append(float(m.group(1)))
-        except ValueError:
+            q = urlparse(last['href']).query
+            page = int(parse_qs(q).get('page', [1])[0])
+            return page
+        except Exception:
             pass
-    if caps:
-        return max(caps)
-    return None
+    # listado numerado
+    pages = []
+    for li in soup.select('ul.pageNav-main li a'):
+        try:
+            pages.append(int(li.get_text(strip=True)))
+        except Exception:
+            continue
+    return max(pages) if pages else 1
 
+def parse_animebbg(session: requests.Session, url: str) -> Optional[float]:
+    # asegurar /capitulos
+    parsed = urlparse(url)
+    path = parsed.path.rstrip('/')
+    if not path.endswith('/capitulos'):
+        url = urljoin(url if url.endswith('/') else url + '/', 'capitulos')
+    r = session.get(url)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
 
+    best = _animebbg_find_max_in_page(soup) or float('-inf')
+    last_page = _animebbg_last_page(soup)
+    if last_page and last_page > 1:
+        sep = '&' if ('?' in url) else '?'
+        last_url = f"{url}{sep}page={last_page}"
+        r2 = session.get(last_url); r2.raise_for_status()
+        soup2 = BeautifulSoup(r2.text, "lxml")
+        best_last = _animebbg_find_max_in_page(soup2)
+        if best_last is not None:
+            best = max(best, best_last)
+    return None if best == float('-inf') else best
+
+# -------- MangasNoSekai (WordPress) --------
+def parse_mangasnosekai(session: requests.Session, url: str) -> Optional[float]:
+    r = session.get(url); r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    vals = []
+    for a in soup.select('.contenedor-capitulo-miniatura .text-sm, .contenedor-capitulo-miniatura a'):
+        txt = a.get_text(" ", strip=True)
+        m = re.search(r'Cap[ií]tulo\s+(\d+(?:\.\d+)?)', txt, re.I)
+        if m:
+            try: vals.append(float(m.group(1)))
+            except: pass
+    return max(vals) if vals else None
+
+# -------- m440.in (WordPress) --------
+def parse_m440(session: requests.Session, url: str) -> Optional[float]:
+    r = session.get(url); r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    vals = []
+    for a in soup.select('a, .wp-block-latest-posts__post-title'):
+        m = re.search(r'Cap[ií]tulo\s+(\d+(?:\.\d+)?)', a.get_text(" ", strip=True), re.I)
+        if m:
+            try: vals.append(float(m.group(1)))
+            except: pass
+    return max(vals) if vals else None
+
+# -------- zonatmo.com --------
+def parse_zonatmo(session: requests.Session, url: str) -> Optional[float]:
+    r = session.get(url); r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    vals = []
+    # títulos colapsables “Capítulo X.YY …”
+    for a in soup.select('.btn-collapse, .list-group-item h4, h4'):
+        m = re.search(r'Cap[ií]tulo\s+(\d+(?:\.\d+)?)', a.get_text(" ", strip=True), re.I)
+        if m:
+            try: vals.append(float(m.group(1)))
+            except: pass
+    return max(vals) if vals else None
+
+# -------- MAPA DE PARSERS --------
 PARSERS = {
-    "manga-oni.com": parse_manga_oni,
-    "www.manga-oni.com": parse_manga_oni,
+    "animebbg.net": parse_animebbg,
+    "www.animebbg.net": parse_animebbg,
 
     "mangasnosekai.com": parse_mangasnosekai,
     "www.mangasnosekai.com": parse_mangasnosekai,
 
-    "zonatmo.com": parse_zonatmo,
-    "www.zonatmo.com": parse_zonatmo,
-
     "m440.in": parse_m440,
     "www.m440.in": parse_m440,
+
+    "zonatmo.com": parse_zonatmo,
+    "www.zonatmo.com": parse_zonatmo,
 }
 
-
-# ----------------- Lógica principal -----------------------
-
+# ================================================================
+# ==================== LÓGICA PRINCIPAL ==========================
+# ================================================================
 def load_library(path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
-        print(f"[ERROR] No encuentro {path}")
-        sys.exit(1)
+        return []
     with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or []
-    # normalizar entradas antiguas (si vinieran con otras claves)
-    norm = []
-    for it in data:
-        if not isinstance(it, dict):
-            continue
-        name = it.get("name") or it.get("title") or it.get("manga") or "Sin nombre"
-        url = it.get("url") or it.get("link") or ""
-        last = it.get("last_chapter")
-        norm.append({"name": name, "url": url, "last_chapter": last})
-    return norm
+        return yaml.safe_load(f) or []
 
-
-def write_library(path: str, items: List[Dict[str, Any]]):
+def save_library(path: str, data: List[Dict[str, Any]]):
     with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(items, f, sort_keys=False, allow_unicode=True)
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 
-
-def get_latest_chapter(series_url: str) -> Tuple[Optional[float], Optional[str]]:
-    """
-    Devuelve (capítulo, error_text). Si hay error, capítulo=None y error_text con mensaje.
-    """
-    dom = domain(series_url)
-    parser = PARSERS.get(dom)
-    if not parser:
-        return None, f"Sin parser para dominio: {dom}"
-    try:
-        resp = get(series_url)
-        ch = parser(resp.text)
-        if ch is None:
-            return None, "No pude detectar capítulo en el HTML"
-        return ch, None
-    except requests.HTTPError as e:
-        return None, f"{e.response.status_code} Client Error: {e}"
-    except Exception as e:
-        return None, f"Error: {e}"
-
-
-def fmt_ch(v: Optional[float]) -> str:
-    if v is None:
-        return "—"
-    if math.isclose(v, int(v)):
-        return str(int(v))
-    return f"{v:.2f}"
-
-
-def run(check_only: bool = False) -> int:
-    lib = load_library(LIB_PATH)
-    any_change = False
-
-    updated_msgs = []
-    error_msgs = []
-
-    for item in lib:
-        name = item.get("name")
-        url = item.get("url")
-        prev = item.get("last_chapter")
-
-        if not url:
-            error_msgs.append(f"**{name}**: URL vacía.")
-            continue
-
-        latest, err = get_latest_chapter(url)
-        if err:
-            error_msgs.append(f"**{name}**: {err} — <{url}>")
-            continue
-
-        # Si last_chapter no estaba, lo inicializamos
-        if prev is None:
-            item["last_chapter"] = latest
-            any_change = True
-            print(f"[BOOTSTRAP] {name}: set last_chapter={fmt_ch(latest)}")
-            continue
-
-        if latest is not None and (prev is None or latest > float(prev)):
-            # Actualización
-            item["last_chapter"] = latest
-            any_change = True
-            updated_msgs.append(
-                f"📗 **{name}** — Nuevo capítulo: **{fmt_ch(latest)}** (antes {fmt_ch(prev)})\n<{url}>"
-            )
-            print(f"[UPDATE] {name}: {fmt_ch(prev)} -> {fmt_ch(latest)}")
-        else:
-            print(f"[OK] {name}: sin cambios (último {fmt_ch(prev)})")
-
-    # guardar cambios
-    if any_change and not check_only:
-        write_library(LIB_PATH, lib)
-
-    # Notificaciones
-    if updated_msgs:
-        send_discord("**Novedades de manga**:\n\n" + "\n\n".join(updated_msgs))
-    else:
-        print("Sin novedades.")
-        # opcional: enviar también a Discord
-        # send_discord("Sin novedades.")
-
-    if error_msgs:
-        send_discord("⚠️ **Errores**:\n\n" + "\n".join(error_msgs))
-        # No hacemos fail del job por errores 403 / parciales.
-
-    return 0
-
+def pick_parser(entry: Dict[str, Any]):
+    # preferir 'site', sino deducir de la URL
+    site = (entry.get("site") or "").strip().lower()
+    if site in PARSERS:
+        return PARSERS[site]
+    netloc = urlparse(entry.get("url", "")).netloc.lower()
+    return PARSERS.get(netloc)
 
 def main():
-    p = argparse.ArgumentParser(description="Checker unificado de mangas")
-    p.add_argument("--check-only", action="store_true",
-                   help="No escribas en el YAML (solo comparar / notificar).")
-    args = p.parse_args()
-    sys.exit(run(check_only=args.check_only))
+    discord = os.getenv("DISCORD_WEBHOOK_URL", "").strip() or None
+    session = build_session()
 
+    lib = load_library(LIB_PATH)
+    if not lib:
+        print("No encuentro manga_library.yml (debe contener tu lista).")
+        sys.exit(0)
+
+    changed = False
+    errors: List[str] = []
+    for entry in lib:
+        name = entry.get("name", "¿Sin nombre?")
+        url = entry.get("url")
+        if not url:
+            continue
+
+        parser = pick_parser(entry)
+        if not parser:
+            errors.append(f"No tengo parser para {urlparse(url).netloc} en ‘{name}’")
+            continue
+
+        try:
+            latest = parser(session, url)
+        except requests.HTTPError as e:
+            errors.append(f"{name}: HTTP Error: {e} — {url}")
+            continue
+        except Exception as e:
+            errors.append(f"{name}: {type(e).__name__}: {e} — {url}")
+            continue
+
+        if latest is None:
+            # no se pudo extraer número
+            continue
+
+        prev = entry.get("last_chapter")
+        # Bootstrap: si nunca se ha guardado, persistir sin notificar
+        if prev is None:
+            entry["last_chapter"] = latest
+            changed = True
+            print(f"[BOOTSTRAP] {name} -> {latest}")
+            continue
+
+        try:
+            prev_num = float(prev)
+        except Exception:
+            prev_num = None
+
+        if prev_num is None or latest > prev_num:
+            # actualizar y notificar
+            entry["last_chapter"] = latest
+            changed = True
+            title = f"{name} — Capítulo {latest:g}"
+            desc = f"Nuevo capítulo detectado: **{latest:g}**"
+            send_discord(discord, title, desc, url)
+            print(f"[NUEVO] {title}")
+        else:
+            print(f"[OK] {name}: sin cambios (último {prev_num:g})")
+
+    if changed:
+        save_library(LIB_PATH, lib)
+    else:
+        print("Sin novedades.")
+
+    # Reporte de errores al final
+    if errors and discord:
+        msg = "\n".join(errors[:10])
+        send_discord(discord, "Errores de scraping", msg, "https://github.com/")
+    for e in errors:
+        print("Error:", e)
 
 if __name__ == "__main__":
     main()
