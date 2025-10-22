@@ -26,6 +26,7 @@ Edita `manga_library.yaml` y añade un bloque como:
 - name: "¿La nueva jefa es mi exnovia?"
   site: "zonatmo.com"
   url: "https://zonatmo.com/library/manhua/84698/lanuevajefaesmiexnovia"
+  last_chapter: null
 ```
 
 ## ¿Cómo evita falsos positivos?
