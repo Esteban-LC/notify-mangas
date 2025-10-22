@@ -1,361 +1,324 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import os
 import re
 import sys
-import os
-import time
-import random
-import argparse
-import urllib.parse as urlparse
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Any, Callable, Optional
 
+import httpx
 import yaml
-import requests
 from bs4 import BeautifulSoup
-from pathlib import Path
 
-# =============================
-# Config
-# =============================
-
-UA_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; rv:125.0) Gecko/20100101 Firefox/125.0",
-]
-
-BASE_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+LIB_PATH = "manga_library.yml"   # <<--- tu archivo
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "DNT": "1",
-    "Upgrade-Insecure-Requests": "1",
-    # pseudo client hints
-    "sec-ch-ua": '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
 }
+JS_SITES = (
+    "m440.in",
+    "mangasnosekai.com",
+    "zonatmo.com",
+    "animebbg.net",
+)
 
-TIMEOUT = 25
-RETRIES = 3
-BACKOFF = 2.0
+# -------------------- utils discord --------------------
 
-CHAPTER_WORDS = ["capítulo", "capitulo", "chapter", "cap", "ch", "episodio", "episode"]
+def _get_discord_webhook() -> Optional[str]:
+    return os.getenv("DISCORD_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL")
 
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
-ALWAYS_NOTIFY = os.getenv("ALWAYS_NOTIFY", "false").lower() in {"1", "true", "yes", "y"}
+def send_discord(content: str, embeds: list[dict[str, Any]] | None = None) -> None:
+    webhook = _get_discord_webhook()
+    if not webhook:
+        print("[WARN] DISCORD_WEBHOOK no configurado; no se enviará notificación.")
+        return
+    payload: dict[str, Any] = {"content": content}
+    if embeds:
+        payload["embeds"] = embeds
+    try:
+        with httpx.Client(timeout=30) as c:
+            r = c.post(webhook, json=payload)
+            r.raise_for_status()
+    except Exception as e:
+        print(f"[WARN] Falló el envío a Discord: {e}")
 
-# =============================
-# Utils
-# =============================
-
-def log_warn(msg: str):
-    print(f"[WARN] {msg}")
-
-def domain_of(url: str) -> str:
-    return urlparse.urlparse(url).netloc.lower().strip()
-
-def base_referer(url: str) -> str:
-    p = urlparse.urlparse(url)
-    return f"{p.scheme}://{p.netloc}"
-
-def fetch_html(url: str) -> str:
-    last_err = None
-    session = requests.Session()
-    # cookies básicos por si el sitio revisa “primera visita”
-    session.cookies.set("cf_clearance", "", domain=domain_of(url))
-    for i in range(RETRIES):
-        headers = dict(BASE_HEADERS)
-        headers["User-Agent"] = random.choice(UA_LIST)
-        headers["Referer"] = base_referer(url)
-
-        try:
-            resp = session.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
-            if resp.status_code == 403:
-                last_err = Exception(f"403 Forbidden en {url}")
-                time.sleep(BACKOFF * (i + 1))
-                continue
-            resp.raise_for_status()
-            # algunos sitios devuelven vacío con 200; verifica tamaño
-            if not resp.text or len(resp.text) < 512:
-                last_err = Exception(f"Respuesta sospechosa (muy corta) en {url}")
-                time.sleep(BACKOFF * (i + 1))
-                continue
-            return resp.text
-        except Exception as e:
-            last_err = e
-            time.sleep(BACKOFF * (i + 1))
-    raise last_err
-
-def normalize_number(txt: str) -> Optional[float]:
-    txt = txt.strip()
-    m = re.search(r"(\d+(?:\.\d+)?)", txt)
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            pass
-    m = re.search(r"(\d+)[-_/\.](\d+)", txt)
-    if m:
-        left, right = m.group(1), m.group(2)
-        try:
-            return float(f"{left}.{right}")
-        except ValueError:
-            return None
-    return None
-
-def parse_chapter_from_text(text: str) -> Optional[float]:
-    patterns = [
-        r"#\s*(\d+(?:\.\d+)?(?:[-_]\d+)?)",
-        r"(?:cap[ií]tulo|cap|ch(?:apter)?)\s*[:#]?\s*(\d+(?:\.\d+)?(?:[-_]\d+)?)",
-        r"(?:episodio|episode)\s*[:#]?\s*(\d+(?:\.\d+)?(?:[-_]\d+)?)",
-    ]
-    low = text.lower()
-    for pat in patterns:
-        m = re.search(pat, low, flags=re.IGNORECASE)
-        if m:
-            return normalize_number(m.group(1))
-    return None
-
-# =============================
-# Parsers por sitio
-# =============================
-
-def parse_madara_latest(html: str) -> Optional[float]:
-    soup = BeautifulSoup(html, "html.parser")
-    container = soup.select_one(".listing-chapters_wrap ul.main") or \
-                soup.select_one(".page-content-listing .listing-chapters_wrap ul.main")
-    if container:
-        for li in container.select("li.wp-manga-chapter"):
-            a = li.find("a")
-            if not a:
-                continue
-            num = parse_chapter_from_text(a.get_text(" ", strip=True))
-            if num is not None:
-                return num
-    for a in soup.find_all("a"):
-        t = a.get_text(" ", strip=True)
-        if not t:
-            continue
-        if any(w in t.lower() for w in CHAPTER_WORDS):
-            num = parse_chapter_from_text(t)
-            if num is not None:
-                return num
-    for a in soup.find_all("a", href=True):
-        href = a["href"].lower()
-        if any(w in href for w in ["capitulo", "chapter", "/ch-"]):
-            m = re.search(r"(?:cap[ií]tulo|chapter|ch|ep|episode)[/_-]*([0-9]+(?:[-.][0-9]+)?)", href)
-            if m:
-                return normalize_number(m.group(1))
-    return None
-
-def parse_m440_latest(html: str) -> Optional[float]:
-    soup = BeautifulSoup(html, "html.parser")
-    for h5 in soup.find_all("h5", class_="EookRAWUYWz"):
-        num = parse_chapter_from_text(h5.get_text(" ", strip=True))
-        if num is not None:
-            return num
-    for li in soup.select("li.EookRAWUYWz-lis"):
-        num = parse_chapter_from_text(li.get_text(" ", strip=True))
-        if num is not None:
-            return num
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        m = re.search(r"/manga/[^/]+/([0-9]+(?:[_.-][0-9]+)?)", href)
-        if m:
-            raw = m.group(1).replace("_", ".")
-            return normalize_number(raw)
-    return None
-
-def parse_zonatmo_latest(html: str) -> Optional[float]:
-    soup = BeautifulSoup(html, "html.parser")
-    for a in soup.find_all("a", href=True):
-        t = a.get_text(" ", strip=True)
-        if t:
-            num = parse_chapter_from_text(t)
-            if num is not None:
-                return num
-        m = re.search(r"/chapter/([0-9]+(?:[-.][0-9]+)?)", a["href"].lower())
-        if m:
-            return normalize_number(m.group(1))
-    body = soup.get_text(" ", strip=True)
-    num = parse_chapter_from_text(body)
-    if num is not None:
-        return num
-    return None
-
-def parse_animebbg_latest(html: str) -> Optional[float]:
-    return parse_madara_latest(html)
-
-def extract_latest_chapter(url: str, html: str) -> Optional[float]:
-    d = domain_of(url)
-    if "bokugents.com" in d or "mangasnosekai.com" in d:
-        return parse_madara_latest(html)
-    if "m440.in" in d:
-        return parse_m440_latest(html)
-    if "zonatmo.com" in d:
-        return parse_zonatmo_latest(html)
-    if "animebbg.net" in d:
-        return parse_animebbg_latest(html)
-    return parse_madara_latest(html) or parse_m440_latest(html) or parse_zonatmo_latest(html)
-
-# =============================
-# YAML I/O
-# =============================
+# -------------------- YAML --------------------
 
 @dataclass
-class SeriesItem:
+class Serie:
     name: str
     site: str
     url: str
     last_chapter: Optional[float]
 
-@dataclass
-class LibraryDoc:
-    path: Path
-    root_key: str
-    items: List[SeriesItem]
-
-def detect_yaml_path(cli_path: Optional[str]) -> Path:
-    if cli_path:
-        p = Path(cli_path)
-        if not p.exists():
-            raise FileNotFoundError(f"No existe el archivo: {cli_path}")
-        return p
-    for candidate in ("manga_library.yml", "series.yml"):
-        p = Path(candidate)
-        if p.exists():
-            return p
-    raise FileNotFoundError("No se encontró ni 'manga_library.yml' ni 'series.yml'.")
-
-def load_library(path: Path) -> LibraryDoc:
-    with path.open("r", encoding="utf-8") as f:
+def load_series(path: str = LIB_PATH) -> list[Serie]:
+    if not os.path.exists(path):
+        print(f"[INFO] No existe {path}; creando estructura vacía.")
+        return []
+    with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    if isinstance(data, dict):
-        if "series" in data and isinstance(data["series"], list):
-            raw_list = data["series"]; root_key = "series"
-        else:
-            keys_with_list = [k for k, v in data.items() if isinstance(v, list)]
-            root_key = keys_with_list[0] if keys_with_list else "series"
-            raw_list = data.get(root_key, [])
-    elif isinstance(data, list):
-        root_key, raw_list = "series", data
-    else:
-        root_key, raw_list = "series", []
-    items: List[SeriesItem] = []
-    for it in raw_list:
-        if not isinstance(it, dict): continue
-        items.append(SeriesItem(
-            name=str(it.get("name", "")).strip(),
-            site=str(it.get("site", "")).strip(),
-            url=str(it.get("url", "")).strip(),
-            last_chapter=it.get("last_chapter", None),
-        ))
-    return LibraryDoc(path=path, root_key=root_key, items=items)
+    items = []
+    for s in data.get("series", []):
+        items.append(
+            Serie(
+                name=s.get("name", "").strip(),
+                site=s.get("site", "").strip(),
+                url=s.get("url", "").strip(),
+                last_chapter=float(s["last_chapter"]) if s.get("last_chapter") is not None else None,
+            )
+        )
+    return items
 
-def save_library(doc: LibraryDoc):
-    out_list = []
-    for it in doc.items:
-        out_list.append({
-            "name": it.name,
-            "site": it.site,
-            "url": it.url,
-            "last_chapter": it.last_chapter if it.last_chapter is not None else None,
-        })
-    data = {doc.root_key: out_list}
-    with doc.path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+def save_series(series: list[Serie], path: str = LIB_PATH) -> None:
+    data = {"series": []}
+    for s in series:
+        data["series"].append(
+            {
+                "name": s.name,
+                "site": s.site,
+                "url": s.url,
+                "last_chapter": s.last_chapter,
+            }
+        )
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 
-# =============================
-# Discord
-# =============================
+# -------------------- HTTP/Playwright --------------------
 
-def post_to_discord(content: str):
-    if not DISCORD_WEBHOOK:
-        print("[WARN] DISCORD_WEBHOOK no configurado; no se enviará notificación.")
-        return
+def _cookie_for(host: str, extra_cookie_map: dict[str, str]) -> Optional[str]:
+    for k, v in extra_cookie_map.items():
+        if k in host:
+            return v
+    return None
+
+async def _fetch_playwright(url: str, cookies_header: Optional[str] = None, proxy: Optional[str] = None) -> str:
+    from playwright.async_api import async_playwright
+
+    launch_args = {"headless": True}
+    if proxy:
+        launch_args["proxy"] = {"server": proxy}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(**launch_args)
+        context = await browser.new_context(
+            user_agent=DEFAULT_HEADERS["User-Agent"],
+            locale="es-ES",
+            extra_http_headers={"Accept-Language": DEFAULT_HEADERS["Accept-Language"]},
+        )
+        if cookies_header:
+            cookies = []
+            for part in cookies_header.split(";"):
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                name, value = part.split("=", 1)
+                cookies.append({"name": name.strip(), "value": value.strip(), "domain": "."})
+            with contextlib.suppress(Exception):
+                await context.add_cookies(cookies)
+
+        page = await context.new_page()
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        # da un respiro a los scripts para poblar DOM
+        await page.wait_for_timeout(1500)
+        html = await page.content()
+        await browser.close()
+        return html
+
+def fetch_html(url: str) -> str:
+    """
+    httpx -> si 403 o sitio JS -> Playwright.
+    Usa PROXY_URL y EXTRA_COOKIES_JSON cuando existan.
+    """
+    proxy_url = os.getenv("PROXY_URL") or None
+    extra_cookies_json = os.getenv("EXTRA_COOKIES_JSON") or None
+
+    parsed_host = url.split("/")[2]
+    cookie_map: dict[str, str] = {}
+    if extra_cookies_json:
+        with contextlib.suppress(Exception):
+            cookie_map = json.loads(extra_cookies_json)
+
+    cookies_header = _cookie_for(parsed_host, cookie_map)
+    headers = DEFAULT_HEADERS.copy()
+    if "animebbg.net" in parsed_host:
+        headers["Referer"] = "https://animebbg.net/"
+
+    # 1) httpx
     try:
-        r = requests.post(DISCORD_WEBHOOK, json={"content": content[:2000]}, timeout=15)
-        if r.status_code >= 300:
-            print(f"[WARN] Discord devolvió {r.status_code}: {r.text[:200]}")
+        with httpx.Client(follow_redirects=True, headers=headers, timeout=30, proxies=proxy_url) as client:
+            if cookies_header:
+                headers2 = headers.copy()
+                headers2["Cookie"] = cookies_header
+                client.headers.update(headers2)
+            r = client.get(url)
+            if r.status_code == 200 and "<html" in r.text.lower():
+                return r.text
+            if r.status_code == 403:
+                raise httpx.HTTPStatusError("403", request=r.request, response=r)
     except Exception as e:
-        print(f"[WARN] Error enviando a Discord: {e}")
+        # 2) Fallback JS
+        if any(h in parsed_host for h in JS_SITES):
+            return asyncio.run(_fetch_playwright(url, cookies_header=cookies_header, proxy=proxy_url))
+        raise e
 
-def format_updates(upds: List[str]) -> str:
-    if not upds: return ""
-    return "**Novedades de mangas:**\n" + "\n".join(f"• {u}" for u in upds)
+    # 3) sitios JS declarados (aunque httpx devolviera 200, a veces es HTML vacío)
+    if any(h in parsed_host for h in JS_SITES):
+        return asyncio.run(_fetch_playwright(url, cookies_header=cookies_header, proxy=proxy_url))
+    return r.text  # type: ignore[name-defined]
 
-def format_errors(errs: List[str]) -> str:
-    if not errs: return ""
-    hdr = "**Avisos/errores:**"
-    # reduce ruido: solo primeros 15
-    body = "\n".join(f"• {e}" for e in errs[:15])
-    more = "" if len(errs) <= 15 else f"\n… y {len(errs)-15} más."
-    return f"{hdr}\n{body}{more}"
+# -------------------- Parsers --------------------
 
-# =============================
-# Main
-# =============================
+CAP_RE = re.compile(r"(\d+(?:\.\d+)?)")
 
-def main():
-    ap = argparse.ArgumentParser(description="Scraper unificado de capítulos.")
-    ap.add_argument("yaml_path", nargs="?", help="Ruta del YAML (p. ej. manga_library.yml).")
-    args = ap.parse_args()
+def _max_cap_from_numbers(texts: list[str]) -> Optional[float]:
+    best: Optional[float] = None
+    for t in texts:
+        for m in CAP_RE.finditer(t):
+            try:
+                val = float(m.group(1))
+                if best is None or val > best:
+                    best = val
+            except Exception:
+                pass
+    return best
 
-    yaml_path = detect_yaml_path(args.yaml_path)
-    lib = load_library(yaml_path)
+def parse_m440(url: str) -> Optional[float]:
+    html = fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+    texts = []
+    for h5 in soup.select("li.EookRAWUYWz-lis h5"):
+        texts.append(h5.get_text(" ", strip=True))
+    if not texts:
+        # fallback amplio
+        texts = [soup.get_text(" ", strip=True)]
+    return _max_cap_from_numbers(texts)
 
-    changed = False
-    updates: List[str] = []
-    errors: List[str] = []
+def parse_msk(url: str) -> Optional[float]:
+    # mangasnosekai.com
+    html = fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+    texts = []
+    # listas típicas: .wp-manga-chapter, .chapter-item, etc.
+    for a in soup.select("li.wp-manga-chapter a, li.chapter-item a, .listing-chapters a, .chapters-list a"):
+        texts.append(a.get_text(" ", strip=True))
+    if not texts:
+        texts = [soup.get_text(" ", strip=True)]
+    return _max_cap_from_numbers(texts)
 
-    for it in lib.items:
-        if not it.url:
-            continue
+def parse_zonatmo(url: str) -> Optional[float]:
+    html = fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+    texts = []
+    for a in soup.find_all("a"):
+        href = a.get("href", "")
+        if "library" in href or "chapter" in href or re.search(r"/\d", href):
+            texts.append(a.get_text(" ", strip=True))
+    if not texts:
+        texts = [soup.get_text(" ", strip=True)]
+    return _max_cap_from_numbers(texts)
+
+def parse_animebbg(url: str) -> Optional[float]:
+    html = fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+    texts = []
+    for a in soup.select("ul li a, .list-group a, a"):
+        t = a.get_text(" ", strip=True)
+        h = a.get("href", "")
+        if re.search(r"\d", t) or re.search(r"\d", h):
+            texts.append(t)
+    if not texts:
+        texts = [soup.get_text(" ", strip=True)]
+    return _max_cap_from_numbers(texts)
+
+def parse_bokugents(url: str) -> Optional[float]:
+    html = fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+    texts = []
+    # suelen usar listas tipo eplister o cards
+    for a in soup.select(".eplister a, .cl, .list a, .chapter a, a"):
+        texts.append(a.get_text(" ", strip=True))
+    if not texts:
+        texts = [soup.get_text(" ", strip=True)]
+    return _max_cap_from_numbers(texts)
+
+def pick_parser(site: str) -> Callable[[str], Optional[float]]:
+    host = (site or "").lower()
+    if "m440.in" in host:
+        return parse_m440
+    if "mangasnosekai.com" in host:
+        return parse_msk
+    if "zonatmo.com" in host:
+        return parse_zonatmo
+    if "animebbg.net" in host:
+        return parse_animebbg
+    if "bokugents.com" in host:
+        return parse_bokugents
+    # genérico: intenta con Playwright y busca números
+    return parse_bokugents
+
+# -------------------- Main --------------------
+
+def main() -> None:
+    series = load_series(LIB_PATH)
+    if not series:
+        print("[INFO] No hay series en manga_library.yml")
+        return
+
+    updates: list[str] = []
+    warnings: list[str] = []
+
+    for s in series:
+        parser = pick_parser(s.site or s.url)
         try:
-            html = fetch_html(it.url)
+            new_ch = parser(s.url)
+            if new_ch is None:
+                warnings.append(f"No pude encontrar capítulo en: {s.url} — «{s.name}»")
+                continue
+
+            if (s.last_chapter is None) or (new_ch > float(s.last_chapter)):
+                updates.append(f"**{s.name}** — {s.last_chapter or 0} -> **{new_ch}**\n<{s.url}>")
+                s.last_chapter = new_ch
+            else:
+                print(f"[OK] Sin cambios: {s.name} (último {s.last_chapter})")
+
+        except httpx.HTTPStatusError as e:
+            warnings.append(f"No se pudo obtener {s.url}: {e}")
         except Exception as e:
-            msg = f"No se pudo obtener {it.url}: {e}"
-            log_warn(msg); errors.append(msg)
-            continue
+            warnings.append(f"Error al parsear {s.url}: {e}")
 
-        latest = extract_latest_chapter(it.url, html)
-        if latest is None:
-            msg = f"No pude encontrar capítulo en: {it.url} — «{it.name}»"
-            log_warn(msg); errors.append(msg)
-            continue
+    # guardar si cambió algo
+    try:
+        save_series(series, LIB_PATH)
+    except Exception as e:
+        warnings.append(f"No pude guardar {LIB_PATH}: {e}")
 
-        prev = it.last_chapter
-        if prev is None or float(latest) > float(prev):
-            line = f"{it.name} — {prev if prev is not None else '0.0'} → {latest}"
-            print(f"[NUEVO] {line}")
-            it.last_chapter = float(latest)
-            updates.append(line)
-            changed = True
-
-        # peq. pausa aleatoria para no quemar al host
-        time.sleep(random.uniform(0.4, 1.1))
-
-    if changed:
-        save_library(lib)
-
-    # ----- Notificación a Discord -----
-    if updates:
-        post_to_discord(format_updates(updates))
-        if errors:
-            post_to_discord(format_errors(errors))
+    # Notificación a Discord
+    always_notify = (os.getenv("ALWAYS_NOTIFY") or "false").lower() == "true"
+    if updates or warnings or always_notify:
+        content = "Sin novedades." if not updates else "Novedades:"
+        embeds: list[dict[str, Any]] = []
+        if updates:
+            embeds.append({
+                "title": "Series con capítulos nuevos",
+                "description": "\n\n".join(updates)[:4000]
+            })
+        if warnings:
+            embeds.append({
+                "title": "Avisos/errores",
+                "description": "\n".join(f"• {w}" for w in warnings)[:4000]
+            })
+        send_discord(content, embeds)
     else:
-        if errors:
-            post_to_discord(format_errors(errors))
-        elif ALWAYS_NOTIFY:
-            post_to_discord("Sin novedades.")
-
-    if not changed:
         print("Sin novedades.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
