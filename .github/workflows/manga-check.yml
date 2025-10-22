@@ -3,7 +3,7 @@ name: Manga Check
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"   # cada 30 minutos
+    - cron: "15 * * * *"  # cada hora al minuto 15 aprox
 
 permissions:
   contents: write
@@ -28,7 +28,7 @@ jobs:
       - name: Run unified scraper
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}  # opcional
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: |
           python unified_manga_scraper.py || true
 
@@ -36,10 +36,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet manga_library.yml; then
+          if [[ -n "$(git status --porcelain)" ]]; then
             git add manga_library.yml
-            git commit -m "update: last_chapter auto"
+            git commit -m "chore: update last_chapter [skip ci]"
             git push
           else
-            echo "No changes to commit."
+            echo "Everything up-to-date"
           fi
