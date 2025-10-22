@@ -1,24 +1,26 @@
 name: Manga Check
 
 on:
+  workflow_dispatch:
   schedule:
-    # cada 30 min (ajústalo si quieres)
-    - cron: "*/30 * * * *"
-  workflow_dispatch: {}  # permite ejecutarlo manualmente
+    - cron: "*/30 * * * *"   # cada 30 minutos (ajústalo si quieres)
+
+permissions:
+  contents: write    # para poder commitear el estado actualizado
 
 jobs:
   check:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
 
       - name: Install dependencies
         run: |
@@ -29,5 +31,14 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          # OJO: tu archivo es .yml (no .yaml). Ajusto el nombre:
-          python unified_manga_scraper.py --library manga_library.yaml
+          python unified_manga_scraper.py --discord "${DISCORD_WEBHOOK_URL}" || true
+
+      - name: Commit state if changed
+        if: hashFiles('.state_changed') != ''
+        run: |
+          rm -f .state_changed
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add manga_state.json
+          git commit -m "chore: update manga_state.json [skip ci]" || echo "No changes to commit"
+          git push
