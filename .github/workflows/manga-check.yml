@@ -1,9 +1,14 @@
 name: Manga Check
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:            # ejecución manual
   schedule:
-    - cron: "15 * * * *"
+    - cron: "*/10 * * * *"      # cada 10 minutos (en UTC)
+
+# evita que dos corridas se solapen si una tarda más de 10 min
+concurrency:
+  group: manga-check
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -11,6 +16,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15         # opcional, corta si algo se queda colgado
     steps:
       - uses: actions/checkout@v4
 
