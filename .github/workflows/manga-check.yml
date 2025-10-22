@@ -2,43 +2,40 @@ name: Manga Check
 
 on:
   workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: "Seed/Bootstrap: guarda el último capítulo sin notificar"
+        required: false
+        default: "false"
   schedule:
-    - cron: "*/30 * * * *"   # cada 30 minutos (ajústalo si quieres)
-
-permissions:
-  contents: write    # para poder commitear el estado actualizado
+    - cron: "*/30 * * * *"
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
       - name: Run unified scraper
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          python unified_manga_scraper.py --discord "${DISCORD_WEBHOOK_URL}" || true
+          if [ "${{ github.event.inputs.bootstrap }}" = "true" ]; then
+            python unified_manga_scraper.py --bootstrap || true
+          else
+            python unified_manga_scraper.py --discord "${DISCORD_WEBHOOK_URL}" || true
+          fi
 
       - name: Commit state if changed
-        if: hashFiles('.state_changed') != ''
         run: |
-          rm -f .state_changed
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add manga_state.json
-          git commit -m "chore: update manga_state.json [skip ci]" || echo "No changes to commit"
+          git add -A
+          git diff --cached --quiet || git commit -m "Update state"
           git push
