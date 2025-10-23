@@ -37,3 +37,18 @@ Edita `manga_library.yaml` y añade un bloque como:
 ## Alternativas “siempre encendido” (opcional)
 - **UptimeRobot** o servicios de “health check” no aplican aquí porque no alojamos un servidor; pero **GitHub Actions programado** ya cumple la función de revisar y notificar.
 - Si prefieres un microservidor, puedes usar un contenedor en alguna plataforma y agendar con `cron`, pero normalmente gastarías créditos gratis y se “dormiría” al no recibir tráfico. Por eso Actions es la vía más simple sin apagones.
+
+# notify-mangas
+
+- Edita `manga_library.yml` con tus series (clave raíz `series:`).
+- Crea secrets en el repositorio:
+  - `DISCORD_WEBHOOK_URL` **o** `DISCORD_WEBHOOK`
+  - opcional: `PROXY_URL` (http/https)
+  - opcional: `EXTRA_COOKIES_JSON` (JSON con cookies por dominio)
+
+El workflow corre cada 10 min y cuando lo dispares manualmente.  
+En Discord verás:
+- **Novedades** (cambios)
+- **Revisadas / sin cambios** (las `[OK]`)
+- **Avisos/errores**
+
