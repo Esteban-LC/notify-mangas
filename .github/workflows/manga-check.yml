@@ -1,9 +1,9 @@
 name: Manga Check
 
 on:
-  workflow_dispatch:            # ejecución manual
+  workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *"      # cada 10 minutos (UTC)
+    - cron: "*/10 * * * *"   # cada 10 minutos (UTC)
 
 concurrency:
   group: manga-check
@@ -16,7 +16,6 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +28,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Fix YAML (pre)
+        run: |
+          python fix_yaml.py
+
       - name: Run unified scraper
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -38,7 +41,7 @@ jobs:
         run: |
           python unified_manga_scraper.py || true
 
-      - name: Fix YAML formatting (idempotente)
+      - name: Fix YAML (post)
         run: |
           python fix_yaml.py
 
