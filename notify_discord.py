@@ -1,84 +1,41 @@
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import json
 import time
-from typing import Iterable, List, Optional
+from typing import List
+
 import requests
 
+MAX_DISCORD = 2000
+CHUNK_SIZE = 1900  # margen para cabeceras/formatos
 
-def _get_webhook_url() -> Optional[str]:
-    # acepta cualquiera de los dos nombres de secret
-    return os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK")
+def _chunks(s: str, n: int = CHUNK_SIZE) -> List[str]:
+    return [s[i:i+n] for i in range(0, len(s), n)]
 
-
-def _chunks(s: str, n: int) -> List[str]:
-    if len(s) <= n:
-        return [s]
-    out, cur, total = [], [], 0
-    for line in s.splitlines():
-        ln = len(line) + 1  # \n
-        if total + ln > n and cur:
-            out.append("\n".join(cur))
-            cur, total = [line], ln
-        else:
-            cur.append(line)
-            total += ln
-    if cur:
-        out.append("\n".join(cur))
-    return out
-
-
-def _post(webhook: str, content: str) -> None:
-    payload = {"content": content}
-    last = None
-    for i in range(3):
-        try:
-            r = requests.post(webhook, json=payload, timeout=15)
-            last = r
-            if r.ok:
-                return
-        except Exception as e:
-            last = e
-        time.sleep(1.5 * (i + 1))
-    print(f"[WARN] Falló enviar a Discord: {last}")
-
-
-def _format_list(title: str, items: Iterable[str]) -> List[str]:
-    body = "\n".join(f"• {i}" for i in items) if items else "—"
-    # 2000 es el límite, dejamos margen por el formato
-    parts = _chunks(body, 1900)
-    return [f"**{title}:**\n```{p}```" for p in parts]
-
-
-def send_discord(
-    updates: Optional[Iterable[str]] = None,
-    warnings: Optional[Iterable[str]] = None,
-    oks: Optional[Iterable[str]] = None,
-) -> None:
-    """
-    Envía el resumen a Discord.
-    - updates: novedades (cambios detectados)
-    - warnings: avisos/errores
-    - oks: revisadas / sin cambios ([OK] ...)
-    """
-    webhook = _get_webhook_url()
-    if not webhook:
-        print("[WARN] DISCORD_WEBHOOK no configurado; no se enviará notificación.")
+def send_lines(webhook_url: str, lines: List[str], username: str = "notify-mangas", avatar_url: str = "") -> None:
+    text = "\n".join(lines).strip()
+    if not text:
         return
 
-    updates = list(updates or [])
-    warnings = list(warnings or [])
-    oks = list(oks or [])
+    blocks = _chunks(text, CHUNK_SIZE)
+    for i, block in enumerate(blocks, 1):
+        payload = {
+            "content": block,
+            "username": username,
+        }
+        if avatar_url:
+            payload["avatar_url"] = avatar_url
 
-    if not updates:
-        _post(webhook, "**Sin novedades.**")
+        resp = requests.post(
+            webhook_url,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Discord {resp.status_code}: {resp.text[:300]}")
 
-    if updates:
-        for block in _format_list("Novedades", updates):
-            _post(webhook, block)
-
-    if oks:
-        for block in _format_list("Revisadas / sin cambios", oks):
-            _post(webhook, block)
-
-    if warnings:
-        for block in _format_list("Avisos/errores", warnings):
-            _post(webhook, block)
+        # evitar rate limit
+        if i < len(blocks):
+            time.sleep(1.2)
