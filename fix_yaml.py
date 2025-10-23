@@ -1,44 +1,32 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import yaml
-from pathlib import Path
 
-LIB = Path("manga_library.yml")
-
-def normalize(series):
-    # orden estable por nombre y normaliza tipos numéricos
-    def to_float(x):
-        try:
-            if x is None:
-                return None
-            return float(str(x).replace("_", "."))
-        except Exception:
-            return x
-
-    out = []
-    for s in series:
-        s = dict(s)
-        s["last_chapter"] = to_float(s.get("last_chapter"))
-        out.append({
-            "name": s.get("name"),
-            "site": s.get("site"),
-            "url": s.get("url"),
-            "last_chapter": s.get("last_chapter"),
-        })
-    out.sort(key=lambda x: (x.get("name") or "").lower())
-    return out
+PATH = "manga_library.yml"
 
 def main():
-    if not LIB.exists():
-        print("manga_library.yml no existe; nada que formatear.")
-        return
-    data = yaml.safe_load(LIB.read_text(encoding="utf-8")) or {}
-    series = data.get("series") or []
-    fixed = {"series": normalize(series)}
-    # volcado estable
-    text = yaml.safe_dump(
-        fixed, sort_keys=False, allow_unicode=True, width=88
-    )
-    LIB.write_text(text, encoding="utf-8")
-    print("manga_library.yml normalizado.")
+    with open(PATH, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    series = data.get("series", [])
+    out = []
+    for it in series:
+        it["name"] = str(it.get("name", "")).strip()
+        it["site"] = str(it.get("site", "")).strip()
+        it["url"] = str(it.get("url", "")).strip()
+        lc = it.get("last_chapter", None)
+        if lc in (None, "", "null"):
+            it["last_chapter"] = None
+        else:
+            try:
+                it["last_chapter"] = float(str(lc).replace(",", "."))
+            except Exception:
+                it["last_chapter"] = None
+        out.append(it)
+
+    with open(PATH, "w", encoding="utf-8") as f:
+        yaml.safe_dump({"series": out}, f, allow_unicode=True, sort_keys=False)
 
 if __name__ == "__main__":
     main()
