@@ -1,171 +1,267 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import re
 import json
+import time
+import math
+import traceback
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict, Any
-from urllib.parse import urlparse
+from typing import Dict, List, Optional, Tuple
+
 import requests
-from bs4 import BeautifulSoup
 import yaml
 
-from notify_discord import send_discord
+# -----------------------------
+# Configuración básica
+# -----------------------------
+LIB_PATH = os.getenv("LIB_PATH", "manga_library.yml")
+USER_AGENT = os.getenv(
+    "SCRAPER_UA",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/129.0 Safari/537.36"
+)
+TIMEOUT = 25
 
+# PROXY opcional: http://user:pass@host:port  o  http://host:port
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
-LIB_PATH = "manga_library.yml"
-
-
-# ---------- utilidades de red ----------
-
-def build_session() -> requests.Session:
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/126.0.0.0 Safari/537.36"),
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "close",
-    })
-
-    proxy = os.getenv("PROXY_URL")
-    if proxy:
-        sess.proxies.update({"http": proxy, "https": proxy})
-
-    # cookies opcionales por dominio (json: {"m440.in": "cookie1=...; x=y"})
-    extra = os.getenv("EXTRA_COOKIES_JSON")
+# Cookies extra opcionales (JSON)
+EXTRA_COOKIES_JSON = os.getenv("EXTRA_COOKIES_JSON", "").strip()
+EXTRA_COOKIES = {}
+if EXTRA_COOKIES_JSON:
     try:
-        cookie_map = json.loads(extra) if extra else {}
+        EXTRA_COOKIES = json.loads(EXTRA_COOKIES_JSON)
     except Exception:
-        cookie_map = {}
-    sess._extra_cookies_map = cookie_map  # type: ignore[attr-defined]
-    return sess
+        EXTRA_COOKIES = {}
 
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "DNT": "1",
+}
 
-def fetch(session: requests.Session, url: str) -> Tuple[Optional[str], Optional[str]]:
+# -----------------------------
+# Utilidades YAML
+# -----------------------------
+def load_series(path: str = LIB_PATH) -> List[Dict]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    series = data.get("series", [])
+    # normaliza tipos
+    for it in series:
+        it["name"] = str(it.get("name", "")).strip()
+        it["site"] = str(it.get("site", "")).strip()
+        it["url"] = str(it.get("url", "")).strip()
+        # last_chapter puede venir como str -> convierte a float si aplica
+        lc = it.get("last_chapter", None)
+        if lc is None or lc == "":
+            it["last_chapter"] = None
+        else:
+            try:
+                it["last_chapter"] = float(str(lc).replace(",", "."))
+            except Exception:
+                it["last_chapter"] = None
+    return series
+
+def save_series(items: List[Dict], path: str = LIB_PATH) -> None:
+    data = {"series": items}
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+# -----------------------------
+# Descarga HTML con tolerancia
+# -----------------------------
+def fetch(url: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    retorna (html, error). En error -> None/str
+    Devuelve (html, err). Si hay error, html=None y err=mensaje.
     """
     try:
-        host = urlparse(url).hostname or ""
-        # inyecta cookies por host si hay coincidencia de sufijo
-        cookie_map = getattr(session, "_extra_cookies_map", {}) or {}
-        cookie_value = None
-        for dom, val in cookie_map.items():
-            if host.endswith(dom):
-                cookie_value = val
-                break
-        headers = {}
-        if cookie_value:
-            headers["Cookie"] = cookie_value
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        if EXTRA_COOKIES:
+            s.cookies.update(EXTRA_COOKIES)
 
-        r = session.get(url, headers=headers, timeout=25)
-        if r.status_code != 200:
-            return None, f"{r.status_code} Forbidden en {url}"
-        return r.text, None
+        resp = s.get(url, timeout=TIMEOUT, proxies=PROXIES, allow_redirects=True)
+        if resp.status_code >= 400:
+            return None, f"{resp.status_code} {resp.reason} en {url}"
+        ct = resp.headers.get("Content-Type", "")
+        if "text/html" not in ct and "application/json" not in ct:
+            # alguna páginas devuelven json de capítulos: igual lo tratamos como texto
+            return resp.text, None
+        return resp.text, None
     except Exception as e:
         return None, str(e)
 
-
-# ---------- parsing de capítulo ----------
-
+# -----------------------------
+# Regex de números
+# -----------------------------
+# Focalizamos primero en marcadores fuertes (atributos/data y href de capítulo)
 _NUMBER_PATTERNS = [
-    # data-number="166_5"  /  data-number="168"
-    re.compile(r'data-number="(\d+(?:[_\.]\d+)?)"', re.I),
-    # href ... /166_5-xxxxx
-    re.compile(r'/(\d+(?:_\d+)?)\-[a-z0-9]+["\']', re.I),
-    # #168 ⠇  /  #159.5 ⠇
-    re.compile(r'#\s*(\d+(?:\.\d+)?)\s*[<\s⠇]', re.I),
-    # Capítulo 168  / Capitulo 168.5
-    re.compile(r'cap[ií]tulo\s*(\d+(?:\.\d+)?)', re.I),
-    # number": "168"  (por si hay JSON embebido)
+    re.compile(r'data-number="(\d+(?:[_\.]\d+)?)"', re.I),                   # data-number="166_5"
+    re.compile(r'/(\d+(?:_\d+)?)\-[a-z0-9]+["\']', re.I),                    # /166_5-abc"
+    # luego medios
+    re.compile(r'#\s*(\d+(?:\.\d+)?)\s*[<\s⠇]', re.I),                       # #166 < ó #166⠇
+    re.compile(r'cap[ií]tulo\s*(\d+(?:\.\d+)?)', re.I),                      # Capítulo 166.5
+    # por último JSON incrustado
     re.compile(r'"number"\s*:\s*"(\d+(?:\.\d+)?)"', re.I),
 ]
 
-def _to_float(raw: str) -> Optional[float]:
-    try:
-        return float(raw.replace("_", "."))
-    except Exception:
-        return None
-
 def extract_latest_from_html(html: str) -> Optional[float]:
-    candidates: List[float] = []
-    for pat in _NUMBER_PATTERNS:
+    """
+    Devuelve el último capítulo real encontrado, filtrando años/fechas y outliers.
+    Reglas:
+      - Descarta números entre 1900 y 2100 (años/fechas).
+      - Descarta >= 10000 (ruido).
+      - Acepta 159.5 y 166_5 -> 166.5.
+    Prioridad: patrones fuertes -> medios -> json.
+    """
+
+    def to_float(raw: str) -> Optional[float]:
+        try:
+            return float(raw.replace("_", "."))
+        except Exception:
+            return None
+
+    def clean(nums: List[float]) -> List[float]:
+        out = []
+        for x in nums:
+            if 1900 <= x <= 2100:    # años/fechas
+                continue
+            if x >= 10000:           # ruido brutal (p.ej. 20381.0)
+                continue
+            out.append(x)
+        return out
+
+    # 1) patrones fuertes
+    strong: List[float] = []
+    for pat in _NUMBER_PATTERNS[:2]:
         for m in pat.findall(html):
-            f = _to_float(m if isinstance(m, str) else m[0])
+            f = to_float(m if isinstance(m, str) else m[0])
             if f is not None:
-                candidates.append(f)
-    if not candidates:
-        return None
-    return max(candidates)
+                strong.append(f)
+    strong = clean(strong)
+    if strong:
+        return max(strong)
 
-# ---------- manejo YAML ----------
+    # 2) patrones medios
+    mid: List[float] = []
+    for pat in _NUMBER_PATTERNS[2:4]:
+        for m in pat.findall(html):
+            f = to_float(m if isinstance(m, str) else m[0])
+            if f is not None:
+                mid.append(f)
+    mid = clean(mid)
+    if mid:
+        return max(mid)
 
-def load_series(path: str = LIB_PATH) -> List[Dict[str, Any]]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    return list(data.get("series") or [])
+    # 3) JSON incrustado
+    soft: List[float] = []
+    for m in _NUMBER_PATTERNS[4].findall(html):
+        f = to_float(m if isinstance(m, str) else m[0])
+        if f is not None:
+            soft.append(f)
+    soft = clean(soft)
+    if soft:
+        return max(soft)
 
-def save_series(items: List[Dict[str, Any]], path: str = LIB_PATH) -> None:
-    data = {"series": items}
-    txt = yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=88)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(txt)
+    return None
 
-# ---------- main ----------
+# -----------------------------
+# Notificación a Discord
+# -----------------------------
+def notify_discord_blocking(lines: List[str]) -> None:
+    """Manda a Discord en bloques de 1900 caracteres."""
+    webhook = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK") or ""
+    if not webhook:
+        print("[WARN] DISCORD_WEBHOOK no configurado; no se enviará notificación.")
+        return
 
-def main():
+    from notify_discord import send_lines
+    try:
+        send_lines(webhook, lines)
+    except Exception as e:
+        print(f"[WARN] Error notificando a Discord: {e}")
+
+# -----------------------------
+# Core
+# -----------------------------
+@dataclass
+class Result:
+    item: Dict
+    latest: Optional[float]
+    error: Optional[str]
+
+def check_item(item: Dict) -> Result:
+    url = item["url"]
+    html, err = fetch(url)
+    if err:
+        return Result(item, None, f"No se pudo obtener {url}: {err}")
+    latest = extract_latest_from_html(html or "")
+    return Result(item, latest, None if latest is not None else f"No pude encontrar capítulo en: {url}")
+
+def main() -> None:
     items = load_series()
+    changes: List[str] = []
+    warns: List[str] = []
 
-    sess = build_session()
+    updated = False
 
-    changes_for_discord: List[str] = []
-    warnings_for_discord: List[str] = []
-    oks_for_discord: List[str] = []
+    for it in items:
+        try:
+            r = check_item(it)
+            if r.error:
+                warns.append(f"• {r.error} — «{it['name']}»")
+                # si no hay latest, no tocamos last_chapter
+                print(f"[WARN] {r.error}")
+                continue
 
-    for s in items:
-        name = s.get("name") or ""
-        url = s.get("url") or ""
-        last = s.get("last_chapter")
-        last_f = _to_float(str(last)) if last is not None else None
+            old = it.get("last_chapter")
+            new = r.latest
 
-        html, err = fetch(sess, url)
-        if err:
-            msg = f"No se pudo obtener {url}: {err}"
+            if old is None and new is not None:
+                it["last_chapter"] = new
+                updated = True
+                changes.append(f"[NUEVO] {it['name']} — 0.0 -> {new}")
+                print(f"[NUEVO] {it['name']} — 0.0 -> {new}")
+            elif new is not None and (old is None or new > float(old)):
+                it["last_chapter"] = new
+                updated = True
+                changes.append(f"[NUEVO] {it['name']} — {old} -> {new}")
+                print(f"[NUEVO] {it['name']} — {old} -> {new}")
+            else:
+                print(f"[OK] Sin cambios: {it['name']} (último {old})")
+
+        except Exception as e:
+            msg = f"Error al parsear {it['url']}: {e}"
+            warns.append(f"• {msg}")
             print(f"[WARN] {msg}")
-            warnings_for_discord.append(msg)
-            # sin HTML no comparamos; seguimos
-            continue
+            traceback.print_exc()
 
-        latest = extract_latest_from_html(html)
-        if latest is None:
-            msg = f"No pude encontrar capítulo en: {url} — «{name}»"
-            print(f"[WARN] {msg}")
-            warnings_for_discord.append(msg)
-            continue
+    # Guarda si hubo cambios
+    if updated:
+        save_series(items)
 
-        # comparar y decidir
-        if last_f is None or latest > last_f:
-            old = last_f if last_f is not None else "?"
-            s["last_chapter"] = latest
-            msg = f"[NUEVO] {name} — {old} -> {latest}"
-            print(msg)
-            changes_for_discord.append(msg)
+    # Arma mensaje para Discord
+    if changes or warns:
+        lines: List[str] = []
+        if not changes:
+            lines.append("Sin novedades.")
         else:
-            msg = f"[OK] Sin cambios: {name} (último {last_f})"
-            print(msg)
-            oks_for_discord.append(msg)
-
-    # guardar YAML (solo si hay cambios ya lo reflejará git)
-    save_series(items)
-
-    # enviar a Discord (incluye “Sin novedades.” si no hubo cambios)
-    send_discord(
-        updates=changes_for_discord,
-        warnings=warnings_for_discord,
-        oks=oks_for_discord,
-    )
+            lines.append("Novedades:")
+            lines.extend([f"• {x}" for x in changes])
+        if warns:
+            lines.append("")
+            lines.append("Avisos/errores:")
+            lines.extend(warns)
+        notify_discord_blocking(lines)
+    else:
+        print("Sin novedades.")
 
 if __name__ == "__main__":
     main()
